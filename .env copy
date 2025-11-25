@@ -1,0 +1,9 @@
+# Token bot Telegram
+TELEGRAM_TOKEN=8381170347:AAFbqSsHZL0kgg89bE-RwZqGSyeeENDAeBU
+
+# API key Fastbit
+FASTBIT_API_KEY=GpJR4vByAHo5lYccwNNJfSRwxyqH2ohx
+
+# Whitelist user (opsional):
+# isi ID Telegram, dipisah koma. Kalau dikosongkan, semua user boleh.
+BOT_ALLOWED_USER_IDS=8218061632,8193691342
