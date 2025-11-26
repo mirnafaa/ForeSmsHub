@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- 1. KONFIGURASI DARI .ENV ---
+# --- 1. KONFIGURASI ---
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_KEY = os.getenv("SMSHUB_API_KEY")
@@ -19,7 +19,7 @@ TARGET_COUNTRY = "6"      # Indonesia
 TARGET_SERVICE = "asy"    # Fore Coffee
 TARGET_PRICE = "0.0181"   # Max Harga
 
-# Header Template Fore
+# Header Template
 BASE_HEADERS_TEMPLATE = {
     'Host': 'api.fore.coffee', 'language': 'id',
     'User-Agent': 'Fore Coffee/4.11.0 (coffee.fore.fore; build:1577; iOS 18.5.0) Alamofire/5.10.2',
@@ -37,12 +37,13 @@ CREDENTIALS = [
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN)
-manual_stops = {} 
+manual_stops = {}
+# Dictionary untuk menyimpan sesi aktif agar bisa di-resend
+active_sessions = {} 
 
-# --- 2. HTTP SESSION & SAFE TELEGRAM (ANTI CRASH) ---
+# --- 2. HTTP SESSION & SAFE TELEGRAM ---
 
 def get_session():
-    """Membuat session request yang tahan banting (Auto Retry)"""
     session = requests.Session()
     retry = Retry(connect=3, backoff_factor=0.5)
     adapter = HTTPAdapter(max_retries=retry)
@@ -52,27 +53,25 @@ def get_session():
 session = get_session()
 
 def safe_send_message(chat_id, text, reply_markup=None):
-    """Kirim pesan dengan retry otomatis jika internet RTO"""
     for i in range(3):
         try:
             return bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
         except Exception as e:
-            print(f"⚠️ Gagal kirim pesan (Attempt {i+1}): {e}")
+            print(f"⚠️ Gagal kirim pesan: {e}")
             time.sleep(2)
     return None
 
 def safe_edit_message(text, chat_id, message_id, reply_markup=None):
-    """Edit pesan dengan retry otomatis"""
     for i in range(3):
         try:
             return bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=reply_markup)
         except Exception as e:
             if "message is not modified" in str(e): return
-            print(f"⚠️ Gagal edit pesan (Attempt {i+1}): {e}")
+            print(f"⚠️ Gagal edit pesan: {e}")
             time.sleep(2)
     return None
 
-# --- 3. FUNGSI API FORE & SMSHUB ---
+# --- 3. FUNGSI API ---
 
 def normalize_phone(phone):
     phone = str(phone).strip().replace('-', '').replace(' ', '').replace('+', '')
@@ -113,6 +112,7 @@ def order_smshub():
     except Exception as e: return {"status": "error", "msg": str(e)}
 
 def set_status(id, status):
+    # Status: 1=Ready, 3=Retry (Minta SMS Lagi), 6=Selesai, 8=Cancel
     try: session.get(f"https://smshub.org/stubs/handler_api.php?api_key={API_KEY}&action=setStatus&id={id}&status={status}", timeout=10)
     except: pass
 
@@ -126,32 +126,62 @@ def get_balance():
         return resp.split(":")[1] + " RUB" if "ACCESS_BALANCE" in resp else resp
     except: return "Error"
 
-# --- 4. WORKER LOGIC (THE HUNTER) ---
+# --- 4. WORKER: MONITORING RESEND ---
+
+def monitor_resend(chat_id, msg_id, act_id, phone, headers, clean_phone):
+    """
+    Fungsi khusus untuk memonitor OTP KEDUA/KETIGA setelah tombol Resend diklik.
+    """
+    safe_edit_message(f"🔄 **Menunggu OTP Baru...**\n📱 `{phone}`", chat_id, msg_id)
+    
+    wait_start = time.time()
+    
+    while time.time() - wait_start < 300: # 5 Menit Timeout
+        status_sms = get_status(act_id)
+
+        if "STATUS_OK" in status_sms:
+            # OTP BARU MASUK
+            otp_code = status_sms.split(":")[1]
+            
+            success_text = (
+                f"✅ **OTP BARU DITERIMA!**\n"
+                f"📱 `{phone}`\n"
+                f"🔑 `{otp_code}`\n"
+            )
+            # Tombol Tetap Ada (Bisa Resend Lagi atau Done)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ Selesai (Done)", callback_data=f"done_{act_id}"))
+            markup.add(types.InlineKeyboardButton("🔄 Resend OTP Lagi", callback_data=f"resend_{act_id}"))
+            
+            safe_send_message(chat_id, f"🔔 OTP Baru: `{otp_code}`")
+            safe_edit_message(success_text, chat_id, msg_id, reply_markup=markup)
+            return # Selesai monitor, tunggu input user selanjutnya
+
+        elif "STATUS_CANCEL" in status_sms:
+            safe_edit_message(f"🚫 {phone} Dibatalkan Server.", chat_id, msg_id)
+            return
+
+        time.sleep(3)
+    
+    # Jika timeout
+    safe_edit_message(f"❌ {phone} Timeout Resend (Tidak ada SMS).", chat_id, msg_id)
+
+
+# --- 5. WORKER UTAMA (THE HUNTER) ---
 
 def worker_hunt_otp(chat_id, cred_index, worker_num):
-    """
-    Worker ini tidak akan berhenti sampai mendapatkan 1 OTP valid.
-    - Terdaftar? -> Silent Skip -> Beli Baru
-    - Fresh tapi no OTP (5 menit)? -> Cancel -> Beli Baru
-    """
-    
-    while True: # Loop sampai dapat OTP
-        # Cek Stop Manual
-        if manual_stops.get(f"worker_{worker_num}", False):
-            break
+    while True:
+        if manual_stops.get(f"worker_{worker_num}", False): break
 
-        # 1. ORDER NOMOR
+        # 1. BELI
         res = order_smshub()
         if res['status'] != 'success':
-            msg = str(res['msg'])
-            if "NO_NUMBERS" in msg:
-                print(f"[Worker {worker_num}] Stok Habis. Retrying...")
-                time.sleep(5) # Tunggu stok
+            if "NO_NUMBERS" in str(res['msg']):
+                time.sleep(5)
                 continue
-            elif "NO_BALANCE" in msg:
+            elif "NO_BALANCE" in str(res['msg']):
                 safe_send_message(chat_id, f"⚠️ Worker {worker_num} Stop: Saldo Habis.")
                 break
-            # Error lain (Limit active number, dll)
             time.sleep(3)
             continue
 
@@ -168,7 +198,6 @@ def worker_hunt_otp(chat_id, cred_index, worker_num):
 
         token = get_fresh_token(headers)
         if not token: 
-            # Gagal token, skip nomor ini (biarkan silent timeout)
             time.sleep(1)
             continue
         headers['access-token'] = token
@@ -177,25 +206,34 @@ def worker_hunt_otp(chat_id, cred_index, worker_num):
         is_fresh = check_is_registered(clean_phone, headers)
 
         if is_fresh is True:
-            # === NOMOR FRESH ===
             if request_otp_fore(clean_phone, headers):
-                # Update UI
+                # Simpan sesi untuk fitur Resend nanti
+                active_sessions[act_id] = {
+                    'headers': headers,
+                    'phone': full_phone,
+                    'clean_phone': clean_phone,
+                    'chat_id': chat_id
+                }
+
                 msg_text = (
                     f"⚡ **Worker {worker_num}: Menunggu OTP**\n"
                     f"📱 `{full_phone}`\n"
                     f"⏳ _Exp 5 Menit..._"
                 )
                 markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("❌ Cancel Manual", callback_data=f"stop_{worker_num}_{act_id}"))
+                markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data=f"stop_{worker_num}_{act_id}"))
                 
                 sent_msg = safe_send_message(chat_id, msg_text, reply_markup=markup)
                 if not sent_msg: continue 
 
-                # === MONITORING OTP (MAX 5 MENIT) ===
+                # UPDATE SESI dengan message_id
+                active_sessions[act_id]['msg_id'] = sent_msg.message_id
+
+                # MONITORING AWAL
                 wait_start = time.time()
                 got_otp = False
                 
-                while time.time() - wait_start < 300: # 300 detik
+                while time.time() - wait_start < 300:
                     if manual_stops.get(f"worker_{worker_num}", False):
                         set_status(act_id, 8)
                         safe_edit_message(f"🚫 Worker {worker_num} Stopped.", chat_id, sent_msg.message_id)
@@ -206,14 +244,15 @@ def worker_hunt_otp(chat_id, cred_index, worker_num):
                     if "STATUS_OK" in status_sms:
                         otp_code = status_sms.split(":")[1]
                         
-                        # SUKSES DAPAT OTP
                         success_text = (
-                            f"✅ **OTP SUKSES (Worker {worker_num})**\n"
+                            f"✅ **OTP DITERIMA (Worker {worker_num})**\n"
                             f"📱 `{full_phone}`\n"
                             f"🔑 `{otp_code}`\n"
                         )
+                        # DISINI KITA TAMBAHKAN TOMBOL RESEND
                         markup_done = types.InlineKeyboardMarkup()
-                        markup_done.add(types.InlineKeyboardButton("✅ Simpan (Done)", callback_data=f"done_{act_id}"))
+                        markup_done.add(types.InlineKeyboardButton("✅ Selesai (Done)", callback_data=f"done_{act_id}"))
+                        markup_done.add(types.InlineKeyboardButton("🔄 Resend OTP", callback_data=f"resend_{act_id}"))
                         
                         safe_send_message(chat_id, f"🔔 OTP: `{otp_code}`")
                         safe_edit_message(success_text, chat_id, sent_msg.message_id, reply_markup=markup_done)
@@ -223,30 +262,22 @@ def worker_hunt_otp(chat_id, cred_index, worker_num):
                     
                     elif "STATUS_CANCEL" in status_sms:
                         break 
-
                     time.sleep(3)
                 
-                # === KEPUTUSAN SETELAH LOOP ===
                 if got_otp:
-                    break # MISI SELESAI, KELUAR DARI LOOP UTAMA
+                    break # Worker selesai, menunggu aksi user (Done/Resend)
                 else:
-                    # Timeout 5 menit -> Anggap Busuk -> Cancel -> Beli Baru
-                    print(f"[Worker {worker_num}] {full_phone} Timeout (No OTP). Cancel & Replace.")
+                    print(f"[Worker {worker_num}] {full_phone} Timeout. Replace.")
                     set_status(act_id, 8) 
-                    safe_edit_message(f"♻️ `{full_phone}` No OTP > 5m. Mencari baru...", chat_id, sent_msg.message_id)
-                    # Lanjut loop while True (Beli lagi)
-
+                    safe_edit_message(f"♻️ `{full_phone}` Timeout. Ganti Baru...", chat_id, sent_msg.message_id)
+                    # Loop lagi (beli baru)
             else:
-                print(f"[Worker {worker_num}] Gagal Tembak OTP API.")
-        
+                print(f"[Worker {worker_num}] Gagal Req OTP.")
         else:
-            # === NOMOR TERDAFTAR ===
-            print(f"[Worker {worker_num}] {full_phone} Terdaftar. Skip (Silent).")
-            # Jangan cancel, biarkan SMSHub timeout sendiri (Anti-Ban)
+            print(f"[Worker {worker_num}] {full_phone} Terdaftar. Skip.")
             time.sleep(2)
-            # Lanjut loop while True (Beli lagi)
 
-# --- 5. HANDLER TELEGRAM ---
+# --- 6. HANDLER TELEGRAM & CALLBACK ---
 
 def is_allowed(uid): return uid in ALLOWED_USERS
 
@@ -255,7 +286,7 @@ def start(m):
     if not is_allowed(m.from_user.id): return
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("🚀 Beli Massal", "💰 Cek Saldo")
-    safe_send_message(m.chat.id, "🤖 **Fore Hunter V4 Final**\n- Auto Replace Bad Number\n- Silent Skip Registered\n- Anti Crash", reply_markup=markup)
+    safe_send_message(m.chat.id, "🤖 **Fore Hunter V5 (Resend Feature)**", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: m.text == "💰 Cek Saldo")
 def cek_saldo(m):
@@ -265,7 +296,7 @@ def cek_saldo(m):
 @bot.message_handler(func=lambda m: m.text == "🚀 Beli Massal")
 def ask_qty(m):
     if not is_allowed(m.from_user.id): return
-    msg = safe_send_message(m.chat.id, "🔢 **Butuh berapa OTP Sukses?**\n(Contoh: 5)")
+    msg = safe_send_message(m.chat.id, "🔢 **Jumlah Worker?**\n(Contoh: 5)")
     if msg: bot.register_next_step_handler(msg, process_buy)
 
 def process_buy(m):
@@ -275,8 +306,7 @@ def process_buy(m):
         if qty > 20: return safe_send_message(m.chat.id, "⚠️ Maks 20 Worker.")
     except: return
     
-    safe_send_message(m.chat.id, f"⚡ Mengerahkan {qty} Worker...\nWorker hanya berhenti jika dapat OTP.")
-    
+    safe_send_message(m.chat.id, f"⚡ {qty} Worker Berjalan...")
     for i in range(1, qty+1):
         manual_stops[f"worker_{i}"] = False
         t = threading.Thread(target=worker_hunt_otp, args=(m.chat.id, i, i))
@@ -286,42 +316,63 @@ def process_buy(m):
 @bot.callback_query_handler(func=lambda call: True)
 def cb(call):
     action = call.data.split("_")[0]
+    act_id = call.data.split("_")[1]
     
     if action == "stop":
-        worker_num = call.data.split("_")[1]
-        act_id = call.data.split("_")[2]
+        worker_num = call.data.split("_")[1] # Format stop_WORKER_ID
+        real_act_id = call.data.split("_")[2]
         
         manual_stops[f"worker_{worker_num}"] = True
-        set_status(act_id, 8) 
+        set_status(real_act_id, 8) 
         bot.answer_callback_query(call.id, "Stopped")
+        safe_edit_message("🚫 Stopped Manual.", call.message.chat.id, call.message.message_id)
         
     elif action == "done":
-        act_id = call.data.split("_")[1]
-        set_status(act_id, 6) 
+        set_status(act_id, 6) # Finish
+        if act_id in active_sessions: del active_sessions[act_id]
         bot.answer_callback_query(call.id, "Saved")
         safe_edit_message("✅ Order Selesai.", call.message.chat.id, call.message.message_id)
+    
+    elif action == "resend":
+        # 1. Ambil data sesi
+        session_data = active_sessions.get(act_id)
+        if not session_data:
+            bot.answer_callback_query(call.id, "Sesi kadaluarsa/hilang.")
+            return
 
-# --- 6. MAIN LOOP (CLEAN STOP & ANTI CRASH) ---
-print("Bot Fore Hunter Berjalan... (Tekan Ctrl+C untuk Stop)")
+        bot.answer_callback_query(call.id, "Meminta SMS Ulang...")
+        
+        # 2. Set Status SMSHub ke 3 (RETRY)
+        set_status(act_id, 3)
+        
+        # 3. Request Fore Lagi
+        req = request_otp_fore(session_data['clean_phone'], session_data['headers'])
+        
+        if req:
+            # 4. Jalankan Thread Monitoring Khusus Resend
+            t = threading.Thread(target=monitor_resend, args=(
+                session_data['chat_id'], 
+                call.message.message_id, 
+                act_id, 
+                session_data['phone'], 
+                session_data['headers'], 
+                session_data['clean_phone']
+            ))
+            t.start()
+        else:
+            bot.send_message(call.message.chat.id, "❌ Gagal Request OTP ke Fore.")
+
+# --- 7. MAIN LOOP ---
+print("Bot Fore V5 (Resend) Jalan...")
 
 if __name__ == "__main__":
     try:
         while True:
             try:
-                # Polling dengan timeout panjang agar hemat resource dan stabil
                 bot.infinity_polling(timeout=90, long_polling_timeout=5)
             except Exception as e:
-                # Jika error Stop Manual, keluar loop
-                if "Break infinity polling" in str(e):
-                    break
-                
-                # Jika error koneksi, print dan reconnect
-                print(f"⚠️ Koneksi Error: {e}")
-                print("🔄 Reconnecting dalam 3 detik...")
+                if "Break infinity polling" in str(e): break
+                print(f"⚠️ Reconnect: {e}")
                 time.sleep(3)
-                
     except (KeyboardInterrupt, SystemExit):
-        print("\n🛑 Bot Dihentikan Manual (Ctrl+C).")
-        manual_stops.clear()
-        # Opsional: Bisa tambahkan logic untuk cancel semua order aktif disini jika mau
-        print("✅ Shutdown Clean.")
+        print("\n🛑 Stop Manual.")
